@@ -13,6 +13,12 @@ uvicorn app.main:app --reload
 
 Set `MOMENT_DATABASE_PATH` to use a different SQLite database file. The default is `moment.db` in the project directory.
 
+## Deploy on Render
+
+Create a Render Web Service connected to this repository and use Docker as the environment. Render will detect the root `Dockerfile` automatically. Set the health check path to `/health`.
+
+The current deployment uses SQLite, which is suitable for a demo but not durable on Render's ephemeral filesystem. Use a Render persistent disk or migrate the database layer to Postgres before production use.
+
 ## Authentication for this MVP
 
 Pass an arbitrary stable user identifier via `X-User-Id`. This is deliberately a development placeholder; replace `current_user` with JWT/OAuth verification before deployment.
