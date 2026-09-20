@@ -26,7 +26,8 @@ from pydantic import AliasChoices, BaseModel, Field
 DATABASE_PATH = Path(os.getenv("MOMENT_DATABASE_PATH", "moment.db"))
 MEDIA_DIRECTORY = Path(os.getenv("MOMENT_MEDIA_DIRECTORY", "media"))
 MAX_MEDIA_BYTES = int(os.getenv("MOMENT_MAX_MEDIA_BYTES", str(250 * 1024 * 1024)))
-AUTH_SECRET = os.getenv("MOMENT_AUTH_SECRET", "")
+AUTH_SECRET = os.getenv("MOMENT_AUTH_SECRET") or secrets.token_urlsafe(32)
+AUTH_SECRET_FROM_ENV = bool(os.getenv("MOMENT_AUTH_SECRET"))
 AUTH_ALLOW_LEGACY_HEADER = os.getenv("MOMENT_ALLOW_LEGACY_AUTH", "false").lower() == "true"
 TOKEN_TTL_SECONDS = int(os.getenv("MOMENT_TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 ALLOWED_MEDIA_TYPES = {"image", "video", "audio"}
@@ -194,8 +195,8 @@ def initialize_database() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    if not AUTH_SECRET:
-        raise RuntimeError("MOMENT_AUTH_SECRET must be configured")
+    if not AUTH_SECRET_FROM_ENV:
+        print("WARNING: MOMENT_AUTH_SECRET is not configured; generated tokens will be invalidated on restart")
     initialize_database()
 
 

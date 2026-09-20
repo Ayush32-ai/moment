@@ -45,6 +45,8 @@ The current deployment uses SQLite and local media storage, which are suitable f
 ## Authentication
 
 Set `MOMENT_AUTH_SECRET` in Render and local environments to a long random value.
+The service can boot without it for a demo, but generated tokens stop working
+after every restart; production deployments must configure this variable.
 The API provides `POST /auth/register`, `POST /auth/login`, and `GET /auth/me`.
 Registration and login accept JSON:
 
