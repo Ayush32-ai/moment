@@ -176,6 +176,7 @@ def root() -> dict[str, str]:
 
 
 @app.post("/v1/moments", response_model=MomentOut, status_code=status.HTTP_201_CREATED)
+@app.post("/moments", response_model=MomentOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def create_moment(payload: MomentCreate, user_id: Annotated[str, Depends(current_user)]) -> MomentOut:
     now = utc_now()
     moment = MomentOut(id=str(uuid.uuid4()), owner_id=user_id, state=MomentState.draft, created_at=now, **payload.model_dump())
@@ -189,6 +190,7 @@ def create_moment(payload: MomentCreate, user_id: Annotated[str, Depends(current
 
 
 @app.get("/v1/moments", response_model=list[MomentOut])
+@app.get("/moments", response_model=list[MomentOut], include_in_schema=False)
 def list_moments(user_id: Annotated[str, Depends(current_user)], limit: int = Query(default=20, ge=1, le=100)) -> list[MomentOut]:
     with connection() as db:
         rows = db.execute("SELECT * FROM moments WHERE owner_id = ? OR visibility = 'public' ORDER BY created_at DESC LIMIT ?", (user_id, limit)).fetchall()
@@ -196,6 +198,7 @@ def list_moments(user_id: Annotated[str, Depends(current_user)], limit: int = Qu
 
 
 @app.get("/v1/moments/{moment_id}", response_model=MomentOut)
+@app.get("/moments/{moment_id}", response_model=MomentOut, include_in_schema=False)
 def get_moment(moment_id: str, user_id: Annotated[str, Depends(current_user)]) -> MomentOut:
     with connection() as db:
         row = fetch_moment_or_404(db, moment_id)
@@ -205,6 +208,7 @@ def get_moment(moment_id: str, user_id: Annotated[str, Depends(current_user)]) -
 
 
 @app.post("/v1/moments/{moment_id}/contributions/upload-intents", response_model=UploadIntentOut, status_code=status.HTTP_201_CREATED)
+@app.post("/moments/{moment_id}/contributions/upload-intents", response_model=UploadIntentOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def create_upload_intent(moment_id: str, payload: UploadIntentCreate, user_id: Annotated[str, Depends(current_user)]) -> UploadIntentOut:
     if not payload.consent_to_reconstruct:
         raise HTTPException(status_code=422, detail="Explicit reconstruction consent is required")
@@ -224,6 +228,7 @@ def create_upload_intent(moment_id: str, payload: UploadIntentCreate, user_id: A
 
 
 @app.post("/v1/contributions/{contribution_id}/complete", response_model=ContributionOut)
+@app.post("/contributions/{contribution_id}/complete", response_model=ContributionOut, include_in_schema=False)
 def complete_upload(contribution_id: str, user_id: Annotated[str, Depends(current_user)]) -> ContributionOut:
     with connection() as db:
         row = db.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
@@ -238,6 +243,7 @@ def complete_upload(contribution_id: str, user_id: Annotated[str, Depends(curren
 
 
 @app.get("/v1/moments/{moment_id}/contributions", response_model=list[ContributionOut])
+@app.get("/moments/{moment_id}/contributions", response_model=list[ContributionOut], include_in_schema=False)
 def list_contributions(moment_id: str, user_id: Annotated[str, Depends(current_user)]) -> list[ContributionOut]:
     with connection() as db:
         moment = fetch_moment_or_404(db, moment_id)
@@ -248,6 +254,7 @@ def list_contributions(moment_id: str, user_id: Annotated[str, Depends(current_u
 
 
 @app.delete("/v1/contributions/{contribution_id}", response_model=None, status_code=status.HTTP_204_NO_CONTENT)
+@app.delete("/contributions/{contribution_id}", response_model=None, status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)
 def withdraw_contribution(contribution_id: str, user_id: Annotated[str, Depends(current_user)]) -> None:
     with connection() as db:
         row = db.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
@@ -259,6 +266,7 @@ def withdraw_contribution(contribution_id: str, user_id: Annotated[str, Depends(
 
 
 @app.patch("/v1/moments/{moment_id}/processing", response_model=MomentOut)
+@app.patch("/moments/{moment_id}/processing", response_model=MomentOut, include_in_schema=False)
 def update_processing(moment_id: str, payload: ProcessingUpdate, user_id: Annotated[str, Depends(current_user)]) -> MomentOut:
     with connection() as db:
         row = fetch_moment_or_404(db, moment_id)
