@@ -16,7 +16,9 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Generator
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -30,7 +32,10 @@ AUTH_SECRET = os.getenv("MOMENT_AUTH_SECRET") or secrets.token_urlsafe(32)
 AUTH_SECRET_FROM_ENV = bool(os.getenv("MOMENT_AUTH_SECRET"))
 AUTH_ALLOW_LEGACY_HEADER = os.getenv("MOMENT_ALLOW_LEGACY_AUTH", "false").lower() == "true"
 TOKEN_TTL_SECONDS = int(os.getenv("MOMENT_TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 ALLOWED_MEDIA_TYPES = {"image", "video", "audio"}
+spotify_token: tuple[str, float] | None = None
 app = FastAPI(title="Moment API", version="0.1.0", description="Shared-experience reconstruction MVP")
 
 
@@ -76,6 +81,16 @@ class AuthOut(BaseModel):
     user_id: str
     username: str
     email: str
+
+
+class SpotifyTrackOut(BaseModel):
+    id: str
+    name: str
+    artists: list[str]
+    album: str
+    album_image_url: str | None = None
+    preview_url: str | None = None
+    spotify_url: str
 
 
 class MomentOut(MomentCreate):
@@ -292,6 +307,62 @@ def valid_spotify_url(value: str) -> bool:
     return parsed.scheme == "https" and parsed.netloc.lower() in {"open.spotify.com", "spotify.link"}
 
 
+def spotify_access_token() -> str:
+    global spotify_token
+    if spotify_token and spotify_token[1] > time.time() + 30:
+        return spotify_token[0]
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
+        raise HTTPException(status_code=503, detail="Spotify Developer credentials are not configured")
+    credentials = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()).decode()
+    request = UrlRequest(
+        "https://accounts.spotify.com/api/token",
+        data=urlencode({"grant_type": "client_credentials"}).encode(),
+        headers={"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError):
+        raise HTTPException(status_code=502, detail="Spotify authentication failed")
+    token = payload.get("access_token")
+    expires_in = int(payload.get("expires_in", 3600))
+    if not token:
+        raise HTTPException(status_code=502, detail="Spotify did not return an access token")
+    spotify_token = (token, time.time() + expires_in)
+    return token
+
+
+def spotify_search_tracks(query: str, limit: int) -> list[SpotifyTrackOut]:
+    params = urlencode({"q": query, "type": "track", "limit": limit})
+    request = UrlRequest(
+        f"https://api.spotify.com/v1/search?{params}",
+        headers={"Authorization": f"Bearer {spotify_access_token()}"},
+    )
+    try:
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read())
+    except HTTPError as error:
+        if error.code == 401:
+            global spotify_token
+            spotify_token = None
+        raise HTTPException(status_code=502, detail="Spotify search failed")
+    except (URLError, TimeoutError, json.JSONDecodeError):
+        raise HTTPException(status_code=502, detail="Spotify search failed")
+    tracks = payload.get("tracks", {}).get("items", [])
+    return [
+        SpotifyTrackOut(
+            id=track["id"], name=track["name"],
+            artists=[artist["name"] for artist in track.get("artists", [])],
+            album=track.get("album", {}).get("name", ""),
+            album_image_url=(track.get("album", {}).get("images") or [{}])[0].get("url"),
+            preview_url=track.get("preview_url"),
+            spotify_url=track.get("external_urls", {}).get("spotify", f"https://open.spotify.com/track/{track['id']}"),
+        )
+        for track in tracks
+    ]
+
+
 def safe_filename(filename: str) -> str:
     name = Path(filename).name
     return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "upload"
@@ -356,6 +427,16 @@ def auth_me(user_id: Annotated[str, Depends(current_user)]) -> dict[str, str]:
     if not user:
         raise HTTPException(status_code=401, detail="User account no longer exists")
     return {"user_id": user["id"], "username": user["username"], "email": user["email"]}
+
+
+@app.get("/spotify/search", response_model=list[SpotifyTrackOut])
+@app.get("/v1/spotify/search", response_model=list[SpotifyTrackOut], include_in_schema=False)
+def search_spotify(
+    user_id: Annotated[str, Depends(current_user)],
+    query: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=10, ge=1, le=50),
+) -> list[SpotifyTrackOut]:
+    return spotify_search_tracks(query.strip(), limit)
 
 
 @app.get("/health")

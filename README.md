@@ -73,6 +73,27 @@ Tokens expire after seven days by default; configure
 `MOMENT_TOKEN_TTL_SECONDS` if needed. Passwords are stored as salted PBKDF2
 hashes and are never returned by the API.
 
+## Spotify Developer search
+
+Create an app in the Spotify Developer Dashboard and add these Render
+environment variables:
+
+```text
+SPOTIFY_CLIENT_ID=your-client-id
+SPOTIFY_CLIENT_SECRET=your-client-secret
+```
+
+After signing in, search tracks with:
+
+```powershell
+curl.exe "https://your-service.onrender.com/spotify/search?query=Daft%20Punk%20Instant%20Crush" `
+	-H "Authorization: Bearer ACCESS_TOKEN"
+```
+
+The endpoint returns track metadata and `spotify_url`. Send that URL as the
+`spotify_url` field when adding the track to a Moment. The service does not
+download, copy, or stream Spotify audio; playback remains on Spotify.
+
 ## Processing lifecycle
 
 `draft` → `collecting` → `processing` → `ready` (or `failed`). Upload completion moves a moment to `collecting`; calling the processing endpoint starts a simulated reconstruction job. A real worker should consume that job and call the status endpoint after feature matching, alignment, and reconstruction complete.
