@@ -170,6 +170,11 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/")
+def root() -> dict[str, str]:
+    return {"service": "Moment API", "docs": "/docs", "health": "/health"}
+
+
 @app.post("/v1/moments", response_model=MomentOut, status_code=status.HTTP_201_CREATED)
 def create_moment(payload: MomentCreate, user_id: Annotated[str, Depends(current_user)]) -> MomentOut:
     now = utc_now()
