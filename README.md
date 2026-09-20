@@ -50,3 +50,14 @@ Pass an arbitrary stable user identifier via `X-User-Id`. This is deliberately a
 
 `draft` → `collecting` → `processing` → `ready` (or `failed`). Upload completion moves a moment to `collecting`; calling the processing endpoint starts a simulated reconstruction job. A real worker should consume that job and call the status endpoint after feature matching, alignment, and reconstruction complete.
 
+Start processing only after at least one contribution has returned `201`:
+
+```powershell
+curl.exe -X PATCH "https://your-service.onrender.com/moments/MOMENT_ID/processing" `
+	-H "X-User-Id: user-123" `
+	-H "Content-Type: application/json" `
+	-d '{"state":"processing"}'
+```
+
+The API also accepts `status` in place of `state`. Do not send `collecting` to this endpoint; uploads set that state automatically.
+

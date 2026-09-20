@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 DATABASE_PATH = Path(os.getenv("MOMENT_DATABASE_PATH", "moment.db"))
@@ -89,7 +89,7 @@ class ContributionOut(BaseModel):
 
 
 class ProcessingUpdate(BaseModel):
-    state: MomentState
+    state: MomentState | None = Field(default=None, validation_alias=AliasChoices("state", "status"))
     message: str | None = Field(default=None, max_length=500)
 
 
@@ -427,8 +427,10 @@ def update_processing(moment_id: str, payload: ProcessingUpdate, user_id: Annota
     with connection() as db:
         row = fetch_moment_or_404(db, moment_id)
         require_owner(row, user_id)
+        if payload.state is None:
+            raise HTTPException(status_code=422, detail="Send JSON with state: processing, ready, or failed")
         if payload.state not in (MomentState.processing, MomentState.ready, MomentState.failed):
-            raise HTTPException(status_code=422, detail="Processing state must be processing, ready, or failed")
+            raise HTTPException(status_code=422, detail="Processing state must be processing, ready, or failed; collecting is set by upload")
         if payload.state == MomentState.processing:
             uploaded = db.execute("SELECT 1 FROM contributions WHERE moment_id = ? AND upload_status = 'uploaded' LIMIT 1", (moment_id,)).fetchone()
             if not uploaded:
