@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -8,12 +10,17 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Generator
+from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, status
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
 DATABASE_PATH = Path(os.getenv("MOMENT_DATABASE_PATH", "moment.db"))
+MEDIA_DIRECTORY = Path(os.getenv("MOMENT_MEDIA_DIRECTORY", "media"))
+MAX_MEDIA_BYTES = int(os.getenv("MOMENT_MAX_MEDIA_BYTES", str(250 * 1024 * 1024)))
+ALLOWED_MEDIA_TYPES = {"image", "video", "audio"}
 app = FastAPI(title="Moment API", version="0.1.0", description="Shared-experience reconstruction MVP")
 
 
@@ -76,6 +83,9 @@ class ContributionOut(BaseModel):
     consent_to_reconstruct: bool
     upload_status: str
     created_at: datetime
+    source_type: str | None = None
+    source_url: str | None = None
+    media_url: str | None = None
 
 
 class ProcessingUpdate(BaseModel):
@@ -116,11 +126,20 @@ def initialize_database() -> None:
                 filename TEXT NOT NULL, content_type TEXT NOT NULL, captured_at TEXT NOT NULL,
                 duration_ms INTEGER, latitude REAL, longitude REAL, device_timestamp_ms INTEGER,
                 consent_to_reconstruct INTEGER NOT NULL, upload_status TEXT NOT NULL,
+                media_path TEXT, source_type TEXT NOT NULL DEFAULT 'file', source_url TEXT,
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(moment_id) REFERENCES moments(id)
             );
             """
         )
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(contributions)")}
+        if "media_path" not in columns:
+            db.execute("ALTER TABLE contributions ADD COLUMN media_path TEXT")
+        if "source_type" not in columns:
+            db.execute("ALTER TABLE contributions ADD COLUMN source_type TEXT NOT NULL DEFAULT 'file'")
+        if "source_url" not in columns:
+            db.execute("ALTER TABLE contributions ADD COLUMN source_url TEXT")
+    MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
 
 
 @app.on_event("startup")
@@ -150,7 +169,26 @@ def contribution_from_row(row: sqlite3.Row) -> ContributionOut:
         captured_at=datetime.fromisoformat(row["captured_at"]), duration_ms=row["duration_ms"],
         consent_to_reconstruct=bool(row["consent_to_reconstruct"]), upload_status=row["upload_status"],
         created_at=datetime.fromisoformat(row["created_at"]),
+        source_type=row["source_type"], source_url=row["source_url"],
+        media_url=f"/v1/contributions/{row['id']}/media" if row["media_path"] else None,
     )
+
+
+def valid_spotify_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme == "https" and parsed.netloc.lower() in {"open.spotify.com", "spotify.link"}
+
+
+def safe_filename(filename: str) -> str:
+    name = Path(filename).name
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name) or "upload"
+
+
+def can_access_contribution(row: sqlite3.Row, user_id: str) -> None:
+    with connection() as db:
+        moment = fetch_moment_or_404(db, row["moment_id"])
+    if row["contributor_id"] != user_id and moment["owner_id"] != user_id and moment["visibility"] != Visibility.public.value:
+        raise HTTPException(status_code=403, detail="You do not have access to this contribution")
 
 
 def fetch_moment_or_404(db: sqlite3.Connection, moment_id: str) -> sqlite3.Row:
@@ -218,13 +256,131 @@ def create_upload_intent(moment_id: str, payload: UploadIntentCreate, user_id: A
         moment = fetch_moment_or_404(db, moment_id)
         if moment["state"] in (MomentState.ready.value, MomentState.failed.value):
             raise HTTPException(status_code=409, detail="This Moment is no longer accepting contributions")
-        db.execute("""INSERT INTO contributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+        db.execute("""INSERT INTO contributions
+            (id, moment_id, contributor_id, filename, content_type, captured_at, duration_ms,
+             latitude, longitude, device_timestamp_ms, consent_to_reconstruct, upload_status,
+             media_path, source_type, source_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
             contribution_id, moment_id, user_id, payload.filename, payload.content_type, iso(payload.captured_at),
-            payload.duration_ms, payload.latitude, payload.longitude, payload.device_timestamp_ms, 1,
-            "pending_upload", iso(now),
+            payload.duration_ms, payload.latitude, payload.longitude, payload.device_timestamp_ms, 1, "pending_upload",
+            None, "file", None, iso(now),
         ))
-    # Replace this development URL with a short-lived S3/R2 presigned PUT URL in production.
-    return UploadIntentOut(contribution_id=contribution_id, upload_url=f"https://storage.example.invalid/moment/{moment_id}/{contribution_id}", upload_headers={"Content-Type": payload.content_type}, expires_in_seconds=900)
+    return UploadIntentOut(contribution_id=contribution_id, upload_url=f"/v1/contributions/{contribution_id}/media", upload_headers={"Content-Type": payload.content_type}, expires_in_seconds=900)
+
+
+@app.post("/v1/moments/{moment_id}/contributions", response_model=ContributionOut, status_code=status.HTTP_201_CREATED)
+@app.post("/moments/{moment_id}/contributions", response_model=ContributionOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
+async def upload_contribution(
+    moment_id: str,
+    user_id: Annotated[str, Depends(current_user)],
+    captured_at: datetime = Form(...),
+    consent_to_reconstruct: bool = Form(...),
+    file: UploadFile | None = File(default=None),
+    spotify_url: str | None = Form(default=None),
+    duration_ms: int | None = Form(default=None),
+    latitude: float | None = Form(default=None),
+    longitude: float | None = Form(default=None),
+    device_timestamp_ms: int | None = Form(default=None),
+) -> ContributionOut:
+    if not consent_to_reconstruct:
+        raise HTTPException(status_code=422, detail="Explicit reconstruction consent is required")
+    if (file is None) == (spotify_url is None):
+        raise HTTPException(status_code=422, detail="Provide exactly one media file or Spotify URL")
+    if spotify_url and not valid_spotify_url(spotify_url):
+        raise HTTPException(status_code=422, detail="spotify_url must be an HTTPS Spotify track URL")
+
+    now = utc_now()
+    contribution_id = str(uuid.uuid4())
+    media_path: Path | None = None
+    filename = "spotify-track"
+    content_type = "audio/spotify"
+    source_type = "spotify"
+
+    with connection() as db:
+        moment = fetch_moment_or_404(db, moment_id)
+        if moment["state"] in (MomentState.ready.value, MomentState.failed.value):
+            raise HTTPException(status_code=409, detail="This Moment is no longer accepting contributions")
+
+        if file is not None:
+            media_group = (file.content_type or "").split("/", 1)[0]
+            if media_group not in ALLOWED_MEDIA_TYPES:
+                raise HTTPException(status_code=415, detail="Only image, video, and audio files are supported")
+            filename = safe_filename(file.filename or "upload")
+            content_type = file.content_type or "application/octet-stream"
+            media_path = MEDIA_DIRECTORY / f"{contribution_id}-{filename}"
+            total_bytes = 0
+            try:
+                with media_path.open("wb") as destination:
+                    while chunk := await file.read(1024 * 1024):
+                        total_bytes += len(chunk)
+                        if total_bytes > MAX_MEDIA_BYTES:
+                            raise HTTPException(status_code=413, detail="Media file is too large")
+                        destination.write(chunk)
+            except Exception:
+                if media_path.exists():
+                    media_path.unlink()
+                raise
+            await file.close()
+            source_type = media_group
+
+        db.execute("""INSERT INTO contributions
+            (id, moment_id, contributor_id, filename, content_type, captured_at, duration_ms,
+             latitude, longitude, device_timestamp_ms, consent_to_reconstruct, upload_status,
+             media_path, source_type, source_url, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+            contribution_id, moment_id, user_id, filename, content_type, iso(captured_at), duration_ms,
+            latitude, longitude, device_timestamp_ms, 1, "uploaded" if media_path else "linked",
+            str(media_path) if media_path else None, source_type, spotify_url, iso(now),
+        ))
+        db.execute("UPDATE moments SET state = 'collecting' WHERE id = ? AND state = 'draft'", (moment_id,))
+        row = db.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
+    return contribution_from_row(row)
+
+
+@app.get("/v1/contributions/{contribution_id}/media")
+@app.get("/contributions/{contribution_id}/media", include_in_schema=False)
+def get_contribution_media(contribution_id: str, user_id: Annotated[str, Depends(current_user)]) -> FileResponse:
+    with connection() as db:
+        row = db.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+    can_access_contribution(row, user_id)
+    if not row["media_path"] or not Path(row["media_path"]).is_file():
+        raise HTTPException(status_code=404, detail="This contribution is a Spotify link, not an uploaded file")
+    return FileResponse(row["media_path"], media_type=row["content_type"], filename=row["filename"])
+
+
+@app.put("/v1/contributions/{contribution_id}/media", response_model=None, status_code=status.HTTP_204_NO_CONTENT)
+@app.put("/contributions/{contribution_id}/media", response_model=None, status_code=status.HTTP_204_NO_CONTENT, include_in_schema=False)
+async def put_contribution_media(
+    contribution_id: str,
+    request: Request,
+    user_id: Annotated[str, Depends(current_user)],
+) -> None:
+    with connection() as db:
+        row = db.execute("SELECT * FROM contributions WHERE id = ?", (contribution_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Contribution not found")
+        if row["contributor_id"] != user_id:
+            raise HTTPException(status_code=403, detail="Only the contributor may upload this contribution")
+        if row["source_type"] != "file":
+            raise HTTPException(status_code=409, detail="This contribution is not a file upload")
+
+        media_path = MEDIA_DIRECTORY / f"{contribution_id}-{safe_filename(row['filename'])}"
+        total_bytes = 0
+        try:
+            with media_path.open("wb") as destination:
+                async for chunk in request.stream():
+                    total_bytes += len(chunk)
+                    if total_bytes > MAX_MEDIA_BYTES:
+                        raise HTTPException(status_code=413, detail="Media file is too large")
+                    destination.write(chunk)
+        except Exception:
+            if media_path.exists():
+                media_path.unlink()
+            raise
+        db.execute("UPDATE contributions SET media_path = ?, upload_status = 'uploaded' WHERE id = ?", (str(media_path), contribution_id))
+        db.execute("UPDATE moments SET state = 'collecting' WHERE id = ? AND state = 'draft'", (row["moment_id"],))
 
 
 @app.post("/v1/contributions/{contribution_id}/complete", response_model=ContributionOut)
