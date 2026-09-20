@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import os
+import base64
+import hashlib
+import hmac
+import json
 import re
 import shutil
 import sqlite3
+import secrets
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,6 +26,9 @@ from pydantic import AliasChoices, BaseModel, Field
 DATABASE_PATH = Path(os.getenv("MOMENT_DATABASE_PATH", "moment.db"))
 MEDIA_DIRECTORY = Path(os.getenv("MOMENT_MEDIA_DIRECTORY", "media"))
 MAX_MEDIA_BYTES = int(os.getenv("MOMENT_MAX_MEDIA_BYTES", str(250 * 1024 * 1024)))
+AUTH_SECRET = os.getenv("MOMENT_AUTH_SECRET", "")
+AUTH_ALLOW_LEGACY_HEADER = os.getenv("MOMENT_ALLOW_LEGACY_AUTH", "false").lower() == "true"
+TOKEN_TTL_SECONDS = int(os.getenv("MOMENT_TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 ALLOWED_MEDIA_TYPES = {"image", "video", "audio"}
 app = FastAPI(title="Moment API", version="0.1.0", description="Shared-experience reconstruction MVP")
 
@@ -45,6 +54,27 @@ class MomentCreate(BaseModel):
     starts_at: datetime | None = None
     latitude: float | None = Field(default=None, ge=-90, le=90)
     longitude: float | None = Field(default=None, ge=-180, le=180)
+
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=30, pattern=r"^[A-Za-z0-9_.-]+$")
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    username: str | None = Field(default=None, min_length=3, max_length=320)
+    email: str | None = Field(default=None, min_length=3, max_length=320)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AuthOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in_seconds: int
+    user_id: str
+    username: str
+    email: str
 
 
 class MomentOut(MomentCreate):
@@ -121,6 +151,10 @@ def initialize_database() -> None:
                 visibility TEXT NOT NULL, starts_at TEXT, latitude REAL, longitude REAL,
                 state TEXT NOT NULL, created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS contributions (
                 id TEXT PRIMARY KEY, moment_id TEXT NOT NULL, contributor_id TEXT NOT NULL,
                 filename TEXT NOT NULL, content_type TEXT NOT NULL, captured_at TEXT NOT NULL,
@@ -132,6 +166,22 @@ def initialize_database() -> None:
             );
             """
         )
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "username" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN username TEXT")
+            existing_users = db.execute("SELECT id, email FROM users").fetchall()
+            used_usernames: set[str] = set()
+            for existing in existing_users:
+                base = re.sub(r"[^a-z0-9_.-]", "", existing["email"].split("@", 1)[0].lower()) or "user"
+                base = base[:24]
+                username = base
+                suffix = 1
+                while username in used_usernames or len(username) < 3:
+                    username = f"{base[:24 - len(str(suffix))]}{suffix}"
+                    suffix += 1
+                used_usernames.add(username)
+                db.execute("UPDATE users SET username = ? WHERE id = ?", (username, existing["id"]))
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username)")
         columns = {row["name"] for row in db.execute("PRAGMA table_info(contributions)")}
         if "media_path" not in columns:
             db.execute("ALTER TABLE contributions ADD COLUMN media_path TEXT")
@@ -144,13 +194,75 @@ def initialize_database() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
+    if not AUTH_SECRET:
+        raise RuntimeError("MOMENT_AUTH_SECRET must be configured")
     initialize_database()
 
 
-def current_user(x_user_id: Annotated[str | None, Header()] = None) -> str:
-    if not x_user_id or not x_user_id.strip():
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-User-Id header is required")
-    return x_user_id.strip()
+def normalized_email(email: str) -> str:
+    return email.strip().lower()
+
+
+def normalized_username(username: str) -> str:
+    return username.strip().lower()
+
+
+def password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
+    return f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
+
+
+def password_matches(password: str, encoded: str) -> bool:
+    try:
+        algorithm, rounds, salt_hex, digest_hex = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt_hex), int(rounds))
+        return hmac.compare_digest(candidate.hex(), digest_hex)
+    except (TypeError, ValueError):
+        return False
+
+
+def encode_token(user_id: str) -> str:
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {"sub": user_id, "exp": int(time.time()) + TOKEN_TTL_SECONDS}
+
+    def encode(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value, separators=(",", ":")).encode()).rstrip(b"=").decode()
+
+    signing_input = f"{encode(header)}.{encode(payload)}"
+    signature = hmac.new(AUTH_SECRET.encode(), signing_input.encode(), hashlib.sha256).digest()
+    return f"{signing_input}.{base64.urlsafe_b64encode(signature).rstrip(b'=').decode()}"
+
+
+def decode_token(token: str) -> str:
+    try:
+        encoded_header, encoded_payload, encoded_signature = token.split(".", 2)
+        signing_input = f"{encoded_header}.{encoded_payload}"
+        expected = hmac.new(AUTH_SECRET.encode(), signing_input.encode(), hashlib.sha256).digest()
+        provided = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        if not hmac.compare_digest(expected, provided):
+            raise ValueError
+        payload = json.loads(base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4)))
+        if not payload.get("sub") or int(payload.get("exp", 0)) <= int(time.time()):
+            raise ValueError
+        return str(payload["sub"])
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired access token")
+
+
+def current_user(
+    authorization: Annotated[str | None, Header()] = None,
+    x_user_id: Annotated[str | None, Header()] = None,
+) -> str:
+    if authorization:
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() == "bearer" and token:
+            return decode_token(token)
+    if AUTH_ALLOW_LEGACY_HEADER and x_user_id and x_user_id.strip():
+        return x_user_id.strip()
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Bearer access token is required")
 
 
 def moment_from_row(row: sqlite3.Row) -> MomentOut:
@@ -201,6 +313,48 @@ def fetch_moment_or_404(db: sqlite3.Connection, moment_id: str) -> sqlite3.Row:
 def require_owner(row: sqlite3.Row, user_id: str) -> None:
     if row["owner_id"] != user_id:
         raise HTTPException(status_code=403, detail="Only the Moment owner may perform this action")
+
+
+@app.post("/auth/register", response_model=AuthOut, status_code=status.HTTP_201_CREATED)
+@app.post("/v1/auth/register", response_model=AuthOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
+def register(payload: RegisterRequest) -> AuthOut:
+    username = normalized_username(payload.username)
+    email = normalized_email(payload.email)
+    if "@" not in email:
+        raise HTTPException(status_code=422, detail="A valid email address is required")
+    user_id = str(uuid.uuid4())
+    try:
+        with connection() as db:
+            db.execute(
+                "INSERT INTO users (id, username, email, password_hash, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, username, email, password_hash(payload.password), iso(utc_now())),
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="That username or email is already registered")
+    return AuthOut(access_token=encode_token(user_id), expires_in_seconds=TOKEN_TTL_SECONDS, user_id=user_id, username=username, email=email)
+
+
+@app.post("/auth/login", response_model=AuthOut)
+@app.post("/v1/auth/login", response_model=AuthOut, include_in_schema=False)
+def login(payload: LoginRequest) -> AuthOut:
+    identifier = (payload.username or payload.email or "").strip().lower()
+    if not identifier:
+        raise HTTPException(status_code=422, detail="Send username or email")
+    with connection() as db:
+        user = db.execute("SELECT * FROM users WHERE username = ? OR email = ?", (identifier, identifier)).fetchone()
+    if not user or not password_matches(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username/email or password")
+    return AuthOut(access_token=encode_token(user["id"]), expires_in_seconds=TOKEN_TTL_SECONDS, user_id=user["id"], username=user["username"], email=user["email"])
+
+
+@app.get("/auth/me", response_model=dict[str, str])
+@app.get("/v1/auth/me", response_model=dict[str, str], include_in_schema=False)
+def auth_me(user_id: Annotated[str, Depends(current_user)]) -> dict[str, str]:
+    with connection() as db:
+        user = db.execute("SELECT id, username, email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="User account no longer exists")
+    return {"user_id": user["id"], "username": user["username"], "email": user["email"]}
 
 
 @app.get("/health")

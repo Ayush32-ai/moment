@@ -17,17 +17,17 @@ Set `MOMENT_DATABASE_PATH` to use a different SQLite database file. The default 
 
 Create a Moment first, then send a `multipart/form-data` request to
 `POST /moments/{moment_id}/contributions` (or the canonical `/v1` path).
-The request must include `X-User-Id`, `captured_at`, and
+The request must include an `Authorization: Bearer ACCESS_TOKEN` header, `captured_at`, and
 `consent_to_reconstruct=true`. Provide exactly one of:
 
-- `file`: an image, video, or audio file. Browser camera and microphone recordings can be sent as `Blob` or `File` objects.
+	- `file`: an image, video, or audio file. Browser camera and microphone recordings can be sent as `Blob` or `File` objects.
 - `spotify_url`: an HTTPS Spotify track URL. The API stores the link and does not download or copy Spotify audio.
 
 Example file upload:
 
 ```powershell
 curl.exe -X POST "https://your-service.onrender.com/moments/MOMENT_ID/contributions" `
-	-H "X-User-Id: user-123" `
+	-H "Authorization: Bearer ACCESS_TOKEN" `
 	-F "captured_at=2026-09-20T12:00:00Z" `
 	-F "consent_to_reconstruct=true" `
 	-F "file=@recording.webm;type=video/webm"
@@ -42,9 +42,34 @@ Create a Render Web Service connected to this repository and use Docker as the e
 
 The current deployment uses SQLite and local media storage, which are suitable for a demo but not durable on Render's ephemeral filesystem. Use a Render persistent disk or migrate metadata to Postgres and media to S3/R2 before production use.
 
-## Authentication for this MVP
+## Authentication
 
-Pass an arbitrary stable user identifier via `X-User-Id`. This is deliberately a development placeholder; replace `current_user` with JWT/OAuth verification before deployment.
+Set `MOMENT_AUTH_SECRET` in Render and local environments to a long random value.
+The API provides `POST /auth/register`, `POST /auth/login`, and `GET /auth/me`.
+Registration and login accept JSON:
+
+```json
+{"username":"ayush","email":"you@example.com","password":"at-least-8-characters"}
+```
+
+The registration and login responses include `username`. You can also find the
+signed-in user's username at `GET /auth/me`; send the access token in the
+`Authorization: Bearer ACCESS_TOKEN` header. Login accepts either
+`{"username":"ayush","password":"..."}` or
+`{"email":"you@example.com","password":"..."}`.
+
+Use the returned `access_token` on all protected requests:
+
+```powershell
+curl.exe "https://your-service.onrender.com/moments" `
+	-H "Authorization: Bearer ACCESS_TOKEN"
+```
+
+For a short migration period, set `MOMENT_ALLOW_LEGACY_AUTH=true` to allow the
+old `X-User-Id` header. Disable it after clients switch to bearer tokens.
+Tokens expire after seven days by default; configure
+`MOMENT_TOKEN_TTL_SECONDS` if needed. Passwords are stored as salted PBKDF2
+hashes and are never returned by the API.
 
 ## Processing lifecycle
 
@@ -54,7 +79,7 @@ Start processing only after at least one contribution has returned `201`:
 
 ```powershell
 curl.exe -X PATCH "https://your-service.onrender.com/moments/MOMENT_ID/processing" `
-	-H "X-User-Id: user-123" `
+	-H "Authorization: Bearer ACCESS_TOKEN" `
 	-H "Content-Type: application/json" `
 	-d '{"state":"processing"}'
 ```
