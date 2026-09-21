@@ -158,6 +158,22 @@ def connection() -> Generator[sqlite3.Connection, None, None]:
         db.close()
 
 
+def prepare_storage() -> None:
+    global DATABASE_PATH, MEDIA_DIRECTORY
+    try:
+        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(DATABASE_PATH):
+            pass
+    except (OSError, sqlite3.Error) as error:
+        fallback_root = Path("/app") if Path("/app").is_dir() else Path.cwd()
+        DATABASE_PATH = fallback_root / "moment.db"
+        MEDIA_DIRECTORY = fallback_root / "media"
+        DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MEDIA_DIRECTORY.mkdir(parents=True, exist_ok=True)
+        print(f"WARNING: configured media/database path is unavailable ({error}); using {fallback_root}")
+
+
 def initialize_database() -> None:
     with connection() as db:
         db.executescript(
@@ -212,6 +228,7 @@ def initialize_database() -> None:
 def startup() -> None:
     if not AUTH_SECRET_FROM_ENV:
         print("WARNING: MOMENT_AUTH_SECRET is not configured; generated tokens will be invalidated on restart")
+    prepare_storage()
     initialize_database()
 
 

@@ -40,7 +40,7 @@ and `MOMENT_MAX_MEDIA_BYTES` to change local storage and the default 250 MB limi
 
 Create a Render Web Service connected to this repository and use Docker as the environment. Render will detect the root `Dockerfile` automatically. Set the health check path to `/health`.
 
-The current deployment uses SQLite and local media storage, which are suitable for a demo but not durable on Render's ephemeral filesystem. Without a Render persistent disk, a restart or redeploy can erase user accounts, causing valid credentials to return `401 Invalid username/email or password`. Use a Render persistent disk or migrate metadata to Postgres and media to S3/R2 before production use.
+The current deployment uses SQLite and local media storage, which are suitable for a demo but not durable on Render's ephemeral filesystem. Without a Render persistent disk, a restart or redeploy can erase user accounts, causing valid credentials to return `401 Invalid username/email or password`. The app creates missing storage directories and falls back to `/app` if `/var/data` is unavailable, so the service can still boot, but that fallback is not durable. Use a Render persistent disk or migrate metadata to Postgres and media to S3/R2 before production use.
 
 ## Authentication
 
