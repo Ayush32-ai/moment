@@ -40,7 +40,7 @@ and `MOMENT_MAX_MEDIA_BYTES` to change local storage and the default 250 MB limi
 
 Create a Render Web Service connected to this repository and use Docker as the environment. Render will detect the root `Dockerfile` automatically. Set the health check path to `/health`.
 
-The current deployment uses SQLite and local media storage, which are suitable for a demo but not durable on Render's ephemeral filesystem. Use a Render persistent disk or migrate metadata to Postgres and media to S3/R2 before production use.
+The current deployment uses SQLite and local media storage, which are suitable for a demo but not durable on Render's ephemeral filesystem. Without a Render persistent disk, a restart or redeploy can erase user accounts, causing valid credentials to return `401 Invalid username/email or password`. Use a Render persistent disk or migrate metadata to Postgres and media to S3/R2 before production use.
 
 ## Authentication
 
@@ -53,6 +53,10 @@ Registration and login accept JSON:
 ```json
 {"username":"ayush","email":"you@example.com","password":"at-least-8-characters"}
 ```
+
+`/signup` and `/register` are aliases for `/auth/register`; `/login` is an
+alias for `/auth/login`. Send JSON with `Content-Type: application/json`, not
+form data.
 
 The registration and login responses include `username`. You can also find the
 signed-in user's username at `GET /auth/me`; send the access token in the
@@ -69,9 +73,22 @@ curl.exe "https://your-service.onrender.com/moments" `
 
 For a short migration period, set `MOMENT_ALLOW_LEGACY_AUTH=true` to allow the
 old `X-User-Id` header. Disable it after clients switch to bearer tokens.
-Tokens expire after seven days by default; configure
+Tokens expire after 30 days by default; configure
 `MOMENT_TOKEN_TTL_SECONDS` if needed. Passwords are stored as salted PBKDF2
 hashes and are never returned by the API.
+
+Render must have these environment variables configured:
+
+```text
+MOMENT_AUTH_SECRET=<stable-long-random-value>
+MOMENT_DATABASE_PATH=/var/data/moment.db
+MOMENT_MEDIA_DIRECTORY=/var/data/media
+MOMENT_TOKEN_TTL_SECONDS=2592000
+```
+
+Attach a Render persistent disk mounted at `/var/data`. A stable auth secret
+prevents tokens becoming invalid after restarts, and the persistent disk keeps
+registered accounts and uploaded media available after redeploys.
 
 ## Spotify Developer search
 

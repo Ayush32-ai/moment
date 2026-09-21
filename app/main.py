@@ -31,7 +31,7 @@ MAX_MEDIA_BYTES = int(os.getenv("MOMENT_MAX_MEDIA_BYTES", str(250 * 1024 * 1024)
 AUTH_SECRET = os.getenv("MOMENT_AUTH_SECRET") or secrets.token_urlsafe(32)
 AUTH_SECRET_FROM_ENV = bool(os.getenv("MOMENT_AUTH_SECRET"))
 AUTH_ALLOW_LEGACY_HEADER = os.getenv("MOMENT_ALLOW_LEGACY_AUTH", "false").lower() == "true"
-TOKEN_TTL_SECONDS = int(os.getenv("MOMENT_TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
+TOKEN_TTL_SECONDS = int(os.getenv("MOMENT_TOKEN_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 ALLOWED_MEDIA_TYPES = {"image", "video", "audio"}
@@ -388,6 +388,8 @@ def require_owner(row: sqlite3.Row, user_id: str) -> None:
 
 
 @app.post("/auth/register", response_model=AuthOut, status_code=status.HTTP_201_CREATED)
+@app.post("/register", response_model=AuthOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
+@app.post("/signup", response_model=AuthOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 @app.post("/v1/auth/register", response_model=AuthOut, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 def register(payload: RegisterRequest) -> AuthOut:
     username = normalized_username(payload.username)
@@ -407,6 +409,7 @@ def register(payload: RegisterRequest) -> AuthOut:
 
 
 @app.post("/auth/login", response_model=AuthOut)
+@app.post("/login", response_model=AuthOut, include_in_schema=False)
 @app.post("/v1/auth/login", response_model=AuthOut, include_in_schema=False)
 def login(payload: LoginRequest) -> AuthOut:
     identifier = (payload.username or payload.email or "").strip().lower()
